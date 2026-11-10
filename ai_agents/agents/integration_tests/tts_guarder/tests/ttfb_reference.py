@@ -93,6 +93,12 @@ HOOKS = {
         "soul_tts",
         "wss://qa-soul-llm.soulapp.cn/llm",
     ),
+    "kalpa_tts_python": (
+        "kalpa",
+        "KalpaObserver",
+        "kalpa_tts",
+        "wss://api.kalpalabs.ai",
+    ),
 }
 
 
@@ -103,6 +109,8 @@ CONFIGS = {
     "minimax_tts_websocket": ("MinimaxTTSWebsocketConfig", "url"),
     "minimax_tts_websocket_duplex": ("MinimaxTTSWebsocketDuplexConfig", "url"),
     "soul_tts_python": ("SoulTTSWebsocketConfig", "url"),
+    # The voice is part of the path, so the config builds the endpoint.
+    "kalpa_tts_python": ("KalpaTTSConfig", "websocket_url"),
 }
 
 

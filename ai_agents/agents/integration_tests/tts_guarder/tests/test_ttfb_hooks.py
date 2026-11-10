@@ -1,4 +1,4 @@
-"""Deterministic wire fixtures for all seven first-batch TTFB modes."""
+"""Deterministic wire fixtures for the WebSocket TTFB modes."""
 
 import gzip
 import json
@@ -11,6 +11,7 @@ from .ttfb_hooks.bytedance import ByteDanceObserver
 from .ttfb_hooks.bytedance_duplex import ByteDanceDuplexObserver
 from .ttfb_hooks.minimax import MiniMaxObserver
 from .ttfb_hooks.soul import SoulObserver
+from .ttfb_hooks.kalpa import KalpaObserver
 from .test_soul_ttfb_reference import gateway_frame
 
 
@@ -61,6 +62,16 @@ def wire(mode, context, audio=False, empty=False):
                 **({"text": text} if mode == "tts" else {"inputs": [{"text": text}]}),
             }
         )
+    if mode == "kalpa":
+        if audio:
+            return json.dumps(
+                {
+                    "type": "responseAudio",
+                    "response_id": context,
+                    "pcm_b64": "" if empty else "AQA=",
+                }
+            )
+        return json.dumps({"type": "sendText", "text": text})
     body = (
         {
             "event": "task_continued",
@@ -82,6 +93,7 @@ def wire(mode, context, audio=False, empty=False):
         ("minimax", MiniMaxObserver),
         ("minimax-duplex", MiniMaxObserver),
         ("soul", SoulObserver),
+        ("kalpa", KalpaObserver),
     ],
 )
 def test_hook_times_only_first_text_and_nonempty_audio(
@@ -143,6 +155,7 @@ def test_context_does_not_cross_requests(monkeypatch, mode, observer_class):
         ("minimax", "minimax_tts_websocket", "minimax_tts"),
         ("minimax-duplex", "minimax_tts_websocket_duplex", "minimax_tts"),
         ("soul", "soul_tts_python", "soul_tts"),
+        ("kalpa", "kalpa_tts_python", "kalpa_tts"),
     ],
 )
 def test_hook_installs_on_transport_and_restores(
@@ -193,6 +206,7 @@ async def _transport_scenario(monkeypatch, mode, extension, filename):
                 self.url = values["url"]
                 self.uri = self.url
                 self.api_url = self.url
+                self.websocket_url = self.url
                 self.model_id = values["params"]["model_id"]
                 self.params = values["params"]
 
@@ -235,6 +249,7 @@ async def _transport_scenario(monkeypatch, mode, extension, filename):
         ("minimax", MiniMaxObserver),
         ("minimax-duplex", MiniMaxObserver),
         ("soul", SoulObserver),
+        ("kalpa", KalpaObserver),
     ],
 )
 def test_hook_defers_decode_and_retains_first_audio_arrival(
