@@ -41,6 +41,21 @@ CASES = [
         {"params": {"url": "${env:TTFB_ENDPOINT|}"}},
         "wss://env.test/ws",
     ),
+    (
+        "kalpa_tts_python",
+        {"url": "wss://top.test/ws", "params": {"url": "wss://nested.test/ws"}},
+        "wss://top.test/ws",
+    ),
+    (
+        "kalpa_tts_python",
+        {"params": {"url": "wss://nested.test/{voice_id}", "voice_id": "v1"}},
+        "wss://nested.test/v1",
+    ),
+    (
+        "kalpa_tts_python",
+        {"params": {"base_url": "wss://base.test", "voice_id": "v1"}},
+        "wss://base.test/v1/tts/v1/stream",
+    ),
 ]
 
 
