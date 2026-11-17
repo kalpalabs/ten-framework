@@ -157,3 +157,86 @@ def test_input_after_a_failure_does_not_block_the_next_request(server, config):
     ] == [("r2", END_REASON_REQUEST_END)]
     assert server.utterances == ["The next request."]
     assert bytes(rec.audio) == AUDIO
+
+
+# Long enough to start the utterance before its flush (segmented mode).
+LONG_TEXT = "This sentence is long enough to start speaking before the flush."
+
+
+def _error_codes(errors):
+    return [(e["id"], e["code"], e["vendor_info"]["code"]) for e in errors]
+
+
+def test_an_overloaded_refusal_before_the_flush_is_sent_again(server, config):
+    server.overload_responses = 1
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", LONG_TEXT)
+        await rec.send_text(ten_env, "r1", " And a little more.", end=True)
+        await rec.wait_for(lambda rec: rec.ended("r1"))
+
+    rec = run(config, script)
+
+    assert _error_codes(rec.errors()) == [("r1", NON_FATAL_ERROR, "overloaded")]
+    (end,) = rec.of("tts_audio_end")
+    assert end["reason"] == END_REASON_REQUEST_END
+    assert bytes(rec.audio) == AUDIO
+    # Kalpa ended the first connection at the refusal. The request was sent
+    # again in full on a new one, after waiting about a second.
+    first, second = server.sessions
+    assert first["utterances"] == []
+    assert second["utterances"] == [LONG_TEXT + " And a little more."]
+    assert second["opened_at"] - first["opened_at"] >= 1.0
+
+
+def test_an_overloaded_refusal_after_the_flush_is_sent_again(server, config):
+    server.overload_responses = 1
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", "A short reply.", end=True)
+        await rec.wait_for(lambda rec: rec.ended("r1"))
+
+    rec = run(config, script)
+
+    assert _error_codes(rec.errors()) == [("r1", NON_FATAL_ERROR, "overloaded")]
+    (end,) = rec.of("tts_audio_end")
+    assert end["reason"] == END_REASON_REQUEST_END
+    assert bytes(rec.audio) == AUDIO
+    # Kalpa kept the connection and cancelled the response; the request
+    # went out again on a new connection.
+    assert [s["utterances"] for s in server.sessions] == [
+        ["A short reply."],
+        ["A short reply."],
+    ]
+    assert (
+        server.sessions[1]["opened_at"] - server.sessions[0]["opened_at"] >= 1.0
+    )
+
+
+def test_a_request_refused_on_every_attempt_ends_with_an_error(server, config):
+    server.overload_responses = 3
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", "A short reply.", end=True)
+        await rec.send_text(
+            ten_env, "r2", "The next request.", end=True, turn_id=2
+        )
+        await rec.wait_for(lambda rec: rec.ended("r2"), timeout_s=20.0)
+
+    rec = run(config, script, timeout_s=25.0)
+
+    # Sent three times in all, then failed; no audio started for it.
+    assert (
+        _error_codes(rec.errors())
+        == [("r1", NON_FATAL_ERROR, "overloaded")] * 3
+    )
+    assert [
+        (e["request_id"], e["reason"]) for e in rec.of("tts_audio_end")
+    ] == [("r2", END_REASON_REQUEST_END)]
+    assert bytes(rec.audio) == AUDIO
+    # The waits double: about one second, then two, then four.
+    opened = [s["opened_at"] for s in server.sessions]
+    gaps = [later - earlier for earlier, later in zip(opened, opened[1:])]
+    assert len(gaps) == 3
+    assert gaps[0] >= 1.0 and gaps[1] >= 2.0 and gaps[2] >= 4.0
+    assert server.sessions[-1]["utterances"] == ["The next request."]

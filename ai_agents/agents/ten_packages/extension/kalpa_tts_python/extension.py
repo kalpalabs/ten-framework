@@ -25,13 +25,13 @@ from ten_ai_base.tts2 import AsyncTTS2BaseExtension
 from ten_runtime import AsyncTenEnv
 
 from .config import DEFAULT_SAMPLE_RATE, KalpaTTSConfig
-from .kalpa_tts import KalpaTTSClient, KalpaTTSError
+from .kalpa_tts import OVERLOADED, KalpaTTSClient, KalpaTTSError
 
 # Kalpa's limit on the text of one utterance. A longer request continues in a
 # second utterance.
 MAX_UTTERANCE_CHARS = 8000
-# Times one request is sent again after its connection dropped before any of
-# its audio arrived.
+# Times one request is sent again after its connection dropped, or Kalpa
+# refused it as overloaded, before any of its audio arrived.
 MAX_REPLAYS = 2
 # Failed request ids remembered, to recognize their input arriving late.
 MAX_ENDED_REQUESTS = 64
@@ -406,7 +406,9 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
 
         replayable = (
             request.audio_started_at is None
-            and error.response_id is None
+            # An `overloaded` refusal names the utterance, but nothing of it
+            # was generated.
+            and (error.response_id is None or error.error_type == OVERLOADED)
             and request.replays < MAX_REPLAYS
         )
         if not replayable:

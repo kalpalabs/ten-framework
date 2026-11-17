@@ -35,6 +35,11 @@ KEEPALIVE_INTERVAL_S = 60.0
 MAX_CONNECT_ATTEMPTS = 5
 RECONNECT_BASE_DELAY_S = 0.5
 RECONNECT_MAX_DELAY_S = 8.0
+# Kalpa refuses to start an utterance while it is at capacity. Nothing was
+# generated, so the request can be sent again: after about a second, then
+# twice as long for each refusal in a row.
+OVERLOADED = "overloaded"
+OVERLOADED_RETRY_DELAY_S = 1.0
 
 # Failures no reconnect can fix: the key, the account, the voice or the model
 # has to change first.
@@ -148,6 +153,8 @@ class KalpaTTSClient:
         # every state in which waiting longer changes nothing.
         self._settled = asyncio.Event()
         self.failed: KalpaTTSError | None = None
+        # Whether the current connection has delivered any audio.
+        self._heard_audio = False
 
     def start(self) -> None:
         if self._task is None:
@@ -191,8 +198,11 @@ class KalpaTTSClient:
 
     async def _run(self) -> None:
         failures = 0
+        # Connections in a row that ended with an `overloaded` refusal.
+        overloads = 0
         while not self._stopped:
             ws = None
+            self._heard_audio = False
             try:
                 await self._emit("on_connecting")
                 ws = await self._open_session()
@@ -219,6 +229,12 @@ class KalpaTTSClient:
                 return
 
             failures += 1
+            if error.error_type != OVERLOADED:
+                overloads = 0
+            elif self._heard_audio:
+                overloads = 1
+            else:
+                overloads += 1
             will_retry = not error.permanent and failures < MAX_CONNECT_ATTEMPTS
             self._ten_env.log_warn(
                 f"vendor_status: connection ended ({error.error_type}): "
@@ -234,12 +250,12 @@ class KalpaTTSClient:
             await self._emit("on_connection_failed", error, will_retry)
             if not will_retry:
                 return
-            await asyncio.sleep(
-                min(
-                    RECONNECT_BASE_DELAY_S * 2 ** (failures - 1),
-                    RECONNECT_MAX_DELAY_S,
+            delay = RECONNECT_BASE_DELAY_S * 2 ** (failures - 1)
+            if overloads:
+                delay = max(
+                    delay, OVERLOADED_RETRY_DELAY_S * 2 ** (overloads - 1)
                 )
-            )
+            await asyncio.sleep(min(delay, RECONNECT_MAX_DELAY_S))
 
     async def _open_session(self) -> Any:
         ws = await websockets.connect(
@@ -305,6 +321,7 @@ class KalpaTTSClient:
                 if kind == "responseAudio":
                     pcm = _decode_audio(message.get("pcm_b64"))
                     if pcm:
+                        self._heard_audio = True
                         await self._emit("on_audio", pcm, received_at)
                 elif kind == "responseDone":
                     await self._emit(
@@ -315,6 +332,12 @@ class KalpaTTSClient:
                     error = _error_from_message(message)
                     if message.get("fatal"):
                         # Kalpa closes the connection after a fatal error.
+                        # Before the flush, that includes `overloaded`.
+                        return error
+                    if error.error_type == OVERLOADED:
+                        # After the flush Kalpa keeps the connection and
+                        # cancels the response. A new connection takes the
+                        # request again, the same way as before the flush.
                         return error
                     await self._emit("on_response_error", error)
             return KalpaTTSError("stopped", "The client was stopped")

@@ -14,6 +14,7 @@ import base64
 import itertools
 import json
 import threading
+import time
 from typing import Any
 
 from websockets.asyncio.server import serve
@@ -34,8 +35,9 @@ AUDIO_MS = len(AUDIO) * 1000 // (2 * SAMPLE_RATE)
 
 class MockKalpaServer:
     def __init__(self) -> None:
-        # One entry per connection: its `initializeConnection` message, the
-        # messages after it, and the text of each utterance it flushed.
+        # One entry per connection: when it opened, its `initializeConnection`
+        # message, the messages after it, and the text of each utterance it
+        # flushed.
         self.sessions: list[dict[str, Any]] = []
 
         # Scripted behaviour, set by a test before it runs.
@@ -49,6 +51,12 @@ class MockKalpaServer:
         self.drop_on_text = 0
         # The next N responses lose their connection after the first chunk.
         self.drop_mid_audio = 0
+        # The next N utterances are refused as `overloaded` when they start.
+        self.overload_responses = 0
+        # With `generation_config` (segmented mode), an utterance starts once
+        # its text reaches this many characters, or at its flush if shorter.
+        # Kalpa also waits for a complete sentence; the tests need not.
+        self.segment_threshold = 50
 
         self._ids = itertools.count(1)
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -88,6 +96,7 @@ class MockKalpaServer:
 
     async def _handle(self, ws: Any) -> None:
         session: dict[str, Any] = {
+            "opened_at": time.monotonic(),
             "init": None,
             "messages": [],
             "utterances": [],
@@ -122,7 +131,10 @@ class MockKalpaServer:
                 audio_quality="high",
             )
 
+            segmented = init.get("generation_config") is not None
             buffer = ""
+            # The utterance that started before its flush, if any.
+            started: str | None = None
             async for raw in ws:
                 message = json.loads(raw)
                 session["messages"].append(message)
@@ -134,15 +146,60 @@ class MockKalpaServer:
                     ws.transport.abort()
                     return
                 buffer += text
+                if (
+                    segmented
+                    and started is None
+                    and len(buffer.strip()) >= self.segment_threshold
+                ):
+                    started = f"resp_{next(self._ids)}"
+                    if self._refuse():
+                        # Before the flush, Kalpa cannot tell this
+                        # utterance's text from the next one's, so it ends
+                        # the connection.
+                        await self._overloaded(ws, started, fatal=True)
+                        await ws.close(code=1011, reason="utterance failed")
+                        return
+                    await self._created(ws, started)
                 if message.get("flush"):
                     utterance, buffer = buffer, ""
                     session["utterances"].append(utterance)
-                    await self._respond(ws, utterance)
+                    response_id, started = started, None
+                    if response_id is None:
+                        response_id = f"resp_{next(self._ids)}"
+                        if self._refuse():
+                            # After the flush the connection stays open.
+                            await self._overloaded(ws, response_id, fatal=False)
+                            await self._created(ws, response_id)
+                            await self._done(
+                                ws, response_id, utterance, "cancelled"
+                            )
+                            continue
+                        await self._created(ws, response_id)
+                    await self._respond(ws, utterance, response_id)
         except ConnectionClosed:
             pass
 
-    async def _respond(self, ws: Any, utterance: str) -> None:
-        response_id = f"resp_{next(self._ids)}"
+    def _refuse(self) -> bool:
+        if self.overload_responses <= 0:
+            return False
+        self.overload_responses -= 1
+        return True
+
+    async def _overloaded(self, ws: Any, response_id: str, fatal: bool) -> None:
+        await self._send(
+            ws,
+            type="error",
+            fatal=fatal,
+            request_id=response_id,
+            response_id=response_id,
+            error={
+                "type": "overloaded",
+                "message": "The model is temporarily overloaded. "
+                "Retry shortly.",
+            },
+        )
+
+    async def _created(self, ws: Any, response_id: str) -> None:
         await self._send(
             ws,
             type="responseCreated",
@@ -150,6 +207,8 @@ class MockKalpaServer:
             sample_rate=SAMPLE_RATE,
             audio_quality="high",
         )
+
+    async def _respond(self, ws: Any, utterance: str, response_id: str) -> None:
         if self.fail_responses > 0:
             self.fail_responses -= 1
             await self._send(
