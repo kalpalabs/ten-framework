@@ -26,6 +26,7 @@ from ten_runtime import AsyncTenEnv
 
 from .config import DEFAULT_SAMPLE_RATE, KalpaTTSConfig
 from .kalpa_tts import OVERLOADED, KalpaTTSClient, KalpaTTSError
+from .spacing import SentenceSpacing
 
 # Kalpa's limit on the text of one utterance. A longer request continues in a
 # second utterance.
@@ -60,6 +61,8 @@ class _Request:
     sent: int = 0
     # Characters in the utterance that is still open.
     open_chars: int = 0
+    # Supplies the space after a sentence that the next piece would bring.
+    spacing: SentenceSpacing = field(default_factory=SentenceSpacing)
     # Utterances ended, and how many of them Kalpa has finished speaking.
     flushes: int = 0
     done: int = 0
@@ -82,6 +85,10 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
     utterance, which Kalpa starts speaking at its first complete sentences
     and keeps prosodically continuous; `text_input_end` ends it. The base
     class runs one request at a time, so one utterance is open at a time.
+
+    Kalpa takes a sentence as complete once whitespace follows it. A piece
+    that ends a sentence is sent with that space, so the sentence does not
+    wait for the next piece (see `spacing.py`).
 
     A flush drops the connection and opens a new one, so neither text nor
     audio of the interrupted request can reach the next one.
@@ -228,7 +235,7 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
                 # A new request is a reason to try again.
                 self._start_client()
 
-            self._journal(request, t.text or "")
+            self._journal(request, t.text or "", t.text_input_end)
             if t.text_input_end:
                 request.input_ended = True
                 if request.open_chars:
@@ -270,10 +277,13 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
             )
         return request
 
-    def _journal(self, request: _Request, text: str) -> None:
-        # Text is sent as it is: Kalpa appends each message to the utterance,
-        # and the spaces between sentences are part of the input. Whitespace
-        # before the first word would open an utterance with nothing to say.
+    def _journal(self, request: _Request, text: str, last: bool) -> None:
+        # Kalpa appends each message to the utterance, so the text is sent
+        # as it was written. The one change is the space after a sentence,
+        # which moves from the front of the next piece to the end of this
+        # one. Whitespace before the first word would open an utterance
+        # with nothing to say.
+        text = request.spacing.apply(text, last)
         if not text or (not request.open_chars and not text.strip()):
             return
         for piece in _split(text, MAX_UTTERANCE_CHARS):

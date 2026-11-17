@@ -40,10 +40,18 @@ the [Kalpa documentation](https://docs.kalpalabs.ai/text-to-speech#generation-pa
 ## Behavior
 
 - **Streaming.** The session opens when the extension starts. Each
-  `tts_text_input` is sent as it arrives, unchanged. A request is one Kalpa
+  `tts_text_input` is sent as it arrives. A request is one Kalpa
   utterance: Kalpa starts speaking at the first complete sentences and keeps
   the prosody continuous across the request, and `text_input_end` ends it.
   A request longer than 8,000 characters continues in a second utterance.
+- **Sentence ends.** Kalpa speaks a sentence once whitespace follows it. An
+  agent that cuts the reply after each punctuation mark sends that space
+  with the next piece, so the extension sends it with the sentence and
+  drops it from the next piece: the text is the same and audio starts one
+  piece earlier. No space is added inside a number (`3.14`), an
+  abbreviation (`U.S.`), an address with `@` or `/`, or an open quotation
+  or bracket. A name such as `example.com` that the agent cuts at its first
+  dot cannot be told from a sentence end and is sent as `example. com`.
 - **Interruption.** `tts_flush` drops the session and opens a new one, so no
   text or audio of the interrupted request reaches the next one. The
   interrupted request gets `tts_audio_end` with reason `INTERRUPTED`.

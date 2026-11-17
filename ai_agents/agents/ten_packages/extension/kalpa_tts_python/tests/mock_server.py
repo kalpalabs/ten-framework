@@ -13,6 +13,7 @@ import asyncio
 import base64
 import itertools
 import json
+import re
 import threading
 import time
 from typing import Any
@@ -31,6 +32,10 @@ CHUNKS = [
 ]
 AUDIO = b"".join(CHUNKS)
 AUDIO_MS = len(AUDIO) * 1000 // (2 * SAMPLE_RATE)
+
+# A sentence Kalpa takes as complete: its closing mark, then whitespace. A
+# mark at the very end of the text is not one, since the text may go on.
+SENTENCE_END = re.compile(r"[.!?…।]+[)\]\"'”’»]*\s")
 
 
 class MockKalpaServer:
@@ -54,8 +59,8 @@ class MockKalpaServer:
         # The next N utterances are refused as `overloaded` when they start.
         self.overload_responses = 0
         # With `generation_config` (segmented mode), an utterance starts once
-        # its text reaches this many characters, or at its flush if shorter.
-        # Kalpa also waits for a complete sentence; the tests need not.
+        # its text reaches this many characters and holds a complete
+        # sentence, or at its flush. Its first audio follows at once.
         self.segment_threshold = 50
 
         self._ids = itertools.count(1)
@@ -150,6 +155,7 @@ class MockKalpaServer:
                     segmented
                     and started is None
                     and len(buffer.strip()) >= self.segment_threshold
+                    and SENTENCE_END.search(buffer)
                 ):
                     started = f"resp_{next(self._ids)}"
                     if self._refuse():
@@ -160,10 +166,15 @@ class MockKalpaServer:
                         await ws.close(code=1011, reason="utterance failed")
                         return
                     await self._created(ws, started)
+                    # The complete sentences are spoken before the flush.
+                    if self.first_audio_delay_s:
+                        await asyncio.sleep(self.first_audio_delay_s)
+                    await self._audio(ws, started, 0)
                 if message.get("flush"):
                     utterance, buffer = buffer, ""
                     session["utterances"].append(utterance)
                     response_id, started = started, None
+                    spoken = 0 if response_id is None else 1
                     if response_id is None:
                         response_id = f"resp_{next(self._ids)}"
                         if self._refuse():
@@ -175,7 +186,7 @@ class MockKalpaServer:
                             )
                             continue
                         await self._created(ws, response_id)
-                    await self._respond(ws, utterance, response_id)
+                    await self._respond(ws, utterance, response_id, spoken)
         except ConnectionClosed:
             pass
 
@@ -208,7 +219,19 @@ class MockKalpaServer:
             audio_quality="high",
         )
 
-    async def _respond(self, ws: Any, utterance: str, response_id: str) -> None:
+    async def _audio(self, ws: Any, response_id: str, index: int) -> None:
+        await self._send(
+            ws,
+            type="responseAudio",
+            response_id=response_id,
+            pcm_b64=base64.b64encode(CHUNKS[index]).decode(),
+            frame=index,
+        )
+
+    async def _respond(
+        self, ws: Any, utterance: str, response_id: str, spoken: int = 0
+    ) -> None:
+        """Send the audio after the first `spoken` chunks, then the end."""
         if self.fail_responses > 0:
             self.fail_responses -= 1
             await self._send(
@@ -223,16 +246,10 @@ class MockKalpaServer:
             )
             await self._done(ws, response_id, utterance, "cancelled")
             return
-        if self.first_audio_delay_s:
+        if self.first_audio_delay_s and not spoken:
             await asyncio.sleep(self.first_audio_delay_s)
-        for index, chunk in enumerate(CHUNKS):
-            await self._send(
-                ws,
-                type="responseAudio",
-                response_id=response_id,
-                pcm_b64=base64.b64encode(chunk).decode(),
-                frame=index,
-            )
+        for index in range(spoken, len(CHUNKS)):
+            await self._audio(ws, response_id, index)
             if index == 0 and self.drop_mid_audio > 0:
                 self.drop_mid_audio -= 1
                 await asyncio.sleep(0.05)

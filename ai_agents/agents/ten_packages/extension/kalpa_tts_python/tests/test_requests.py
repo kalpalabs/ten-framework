@@ -17,8 +17,9 @@ def test_one_request_is_one_audio_lifecycle(server, config):
 
     rec = run(config, script, done=lambda rec: rec.ended("r1"))
 
-    # The text reaches Kalpa as it was written, in one utterance.
-    assert server.utterances == ["Hello there. How are you?"]
+    # The text reaches Kalpa as it was written, in one utterance. The space
+    # after its last sentence went out before the request was known to end.
+    assert server.utterances == ["Hello there. How are you? "]
     assert bytes(rec.audio) == AUDIO
     assert {f["sample_rate"] for f in rec.of("pcm_frame")} == {SAMPLE_RATE}
 
@@ -42,6 +43,34 @@ def test_one_request_is_one_audio_lifecycle(server, config):
     assert end["request_total_audio_duration_ms"] == AUDIO_MS
     assert end["metadata"]["session_id"] == "session"
     assert end["metadata"]["turn_id"] == 1
+    assert not rec.errors()
+
+
+def test_a_finished_sentence_is_spoken_before_the_next_piece_arrives(
+    server, config
+):
+    # A TEN agent cuts a reply after each punctuation mark, and the space
+    # after the mark starts the next piece. Kalpa speaks a sentence once
+    # whitespace follows it.
+    first = "This first sentence is long enough for Kalpa to start speaking."
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", first)
+        await rec.wait_for(
+            lambda rec: "pcm_frame" in rec.names(), timeout_s=3.0
+        )
+        await rec.send_text(ten_env, "r1", " The second one comes later.")
+        await rec.send_text(ten_env, "r1", "", end=True)
+
+    rec = run(config, script, done=lambda rec: rec.ended("r1"))
+
+    assert server.utterances == [first + " The second one comes later. "]
+    assert bytes(rec.audio) == AUDIO
+    assert rec.names().count("tts_audio_start") == 1
+    assert len(rec.ttfb()) == 1
+    (end,) = rec.of("tts_audio_end")
+    assert end["reason"] == END_REASON_REQUEST_END
+    assert end["request_total_audio_duration_ms"] == AUDIO_MS
     assert not rec.errors()
 
 
