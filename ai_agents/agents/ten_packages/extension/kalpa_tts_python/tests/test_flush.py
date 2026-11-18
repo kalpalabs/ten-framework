@@ -313,3 +313,45 @@ def test_a_flush_while_a_request_is_ending_waits_for_its_last_events(
     assert names.index("tts_audio_end") < names.index("tts_flush_end")
     assert [e["id"] for e in rec.errors()] == ["r1"]
     assert bytes(rec.audio) == CHUNKS[0][:-1] + AUDIO
+
+
+def test_stopping_while_a_request_is_ending_lets_its_last_events_out(
+    server, config, monkeypatch, running
+):
+    ending = threading.Event()
+    # The tester is gone by the time the extension stops, so what the
+    # extension does then is recorded here.
+    order = []
+    extension = running.extension.KalpaTTSExtension
+    report = extension.on_disconnected
+    send_end = extension.send_tts_audio_end
+
+    async def recorded_report(self, *args, **kwargs):
+        if kwargs.get("message") == "stopped":
+            order.append("stopped")
+        else:
+            # r1's last events take a while.
+            ending.set()
+            await asyncio.sleep(0.3)
+        await report(self, *args, **kwargs)
+
+    async def recorded_end(self, **kwargs):
+        order.append((kwargs["request_id"], kwargs["reason"].value))
+        await send_end(self, **kwargs)
+
+    monkeypatch.setattr(extension, "on_disconnected", recorded_report)
+    monkeypatch.setattr(extension, "send_tts_audio_end", recorded_end)
+    server.holds = [1]
+    server.fail_after_chunks = 1
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", "Fails part-way.", end=True)
+        await rec.wait_for(lambda rec: "pcm_frame" in rec.names())
+        server.release()
+        await rec.wait_for(lambda rec: ending.is_set())
+
+    # The extension is stopped here, while r1's last events are on their way.
+    run(config, script)
+
+    # r1 ended once, before the extension reported that it had stopped.
+    assert order == [("r1", END_REASON_ERROR), "stopped"]

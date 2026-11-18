@@ -370,13 +370,15 @@ def test_connections_that_keep_failing_are_given_up_on_until_a_new_request(
     server, config, monkeypatch, running
 ):
     monkeypatch.setattr(running.kalpa_tts, "RECONNECT_BASE_DELAY_S", 0.01)
+    # r1 is waiting for its session when the connections start to fail.
+    server.hold_session = True
     server.fail_sessions = 5
 
     async def script(rec, ten_env):
         await rec.send_text(ten_env, "r1", "Never gets through.", end=True)
-        await rec.wait_for(
-            lambda rec: any(e["code"] == FATAL_ERROR for e in rec.errors())
-        )
+        await asyncio.sleep(0.2)
+        server.release()
+        await rec.wait_for(lambda rec: len(rec.errors()) == 4)
         await rec.send_text(
             ten_env, "r2", "The next request.", end=True, turn_id=2
         )
@@ -384,19 +386,58 @@ def test_connections_that_keep_failing_are_given_up_on_until_a_new_request(
 
     rec = run(config, script)
 
-    # The fifth failure in a row ends the retries, once, with a fatal error.
-    # Before it r1 was sent again and then failed; how many of the failures
-    # it saw depends on when it arrived.
-    codes = _error_codes(rec.errors())
-    assert [code for _, code, _ in codes].count(FATAL_ERROR) == 1
-    assert codes[-1][1:] == (FATAL_ERROR, "connection_closed")
-    assert set(codes[:-1]) == {("r1", NON_FATAL_ERROR, "connection_closed")}
+    # r1 is sent again twice and fails at the third failed connection.
+    # After the fifth the client stops trying. Nothing has to change for a
+    # later connection to work, so that report is not fatal either.
+    assert _error_codes(rec.errors()) == [
+        ("r1", NON_FATAL_ERROR, "connection_closed"),
+        ("r1", NON_FATAL_ERROR, "connection_closed"),
+        ("r1", NON_FATAL_ERROR, "connection_closed"),
+        ("", NON_FATAL_ERROR, "connection_closed"),
+    ]
     # r1 had no audio, so no audio end. A new request is a reason to
     # connect again, and it completes.
     assert rec.ends() == [("r2", END_REASON_REQUEST_END)]
     assert len(server.sessions) == 6
     assert server.utterances == ["The next request."]
     assert bytes(rec.audio) == AUDIO
+
+
+def test_a_client_that_was_given_up_on_cannot_fail_the_next_request(
+    server, config, monkeypatch, running
+):
+    monkeypatch.setattr(running.kalpa_tts, "RECONNECT_BASE_DELAY_S", 0.01)
+    # The client's last report is slow, so r1 arrives after the client gave
+    # up and before it has said so.
+    giving_up = threading.Event()
+    extension = running.extension.KalpaTTSExtension
+    report = extension.on_disconnected
+
+    async def slow_report(self, *args, **kwargs):
+        if self.client is not None and self.client.failed is not None:
+            giving_up.set()
+            await asyncio.sleep(0.3)
+        await report(self, *args, **kwargs)
+
+    monkeypatch.setattr(extension, "on_disconnected", slow_report)
+    server.fail_sessions = 5
+    server.holds = [1]
+
+    async def script(rec, ten_env):
+        await rec.wait_for(lambda rec: giving_up.is_set())
+        await rec.send_text(ten_env, "r1", "Runs on a new client.", end=True)
+        await rec.wait_for(lambda rec: "pcm_frame" in rec.names())
+        # The old client's report would have arrived by now.
+        await asyncio.sleep(0.5)
+        server.release()
+        await rec.wait_for(lambda rec: rec.ended("r1"))
+
+    rec = run(config, script)
+
+    assert not rec.errors()
+    assert rec.ends() == [("r1", END_REASON_REQUEST_END)]
+    assert bytes(rec.audio) == AUDIO
+    assert len(server.sessions) == 6
 
 
 def test_a_used_up_allowance_is_fatal_and_not_retried(server, config):

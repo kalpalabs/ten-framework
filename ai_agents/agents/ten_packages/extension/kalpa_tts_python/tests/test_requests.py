@@ -3,6 +3,7 @@
 # Licensed under the Apache License, Version 2.0.
 # See the LICENSE file for more information.
 #
+import asyncio
 import os
 
 from ten_packages.extension.kalpa_tts_python.config import (
@@ -186,6 +187,34 @@ def test_ttfb_runs_from_the_first_text_sent_to_the_first_audio(
     rec = run(config, script)
 
     assert rec.ttfb() == [125]
+
+
+def test_ttfb_is_reported_when_audio_arrives_before_the_send_returns(
+    server, config, monkeypatch, running
+):
+    # On a slow socket the send of a text can still be waiting when the
+    # audio it asked for arrives.
+    client = running.kalpa_tts.KalpaTTSClient
+    send = client.send_text
+
+    async def slow_send(self, text, flush=False):
+        await send(self, text, flush)
+        if text.strip():
+            await asyncio.sleep(0.2)
+
+    monkeypatch.setattr(client, "send_text", slow_send)
+    first = "This first sentence is long enough for Kalpa to start speaking."
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", first)
+        await rec.send_text(ten_env, "r1", " And the rest.", end=True)
+        await rec.wait_for(lambda rec: rec.ended("r1"))
+
+    rec = run(config, script)
+
+    assert len(rec.ttfb()) == 1
+    assert bytes(rec.audio) == AUDIO
+    assert not rec.errors()
 
 
 def test_usage_is_reported_once_for_each_request(server, config):

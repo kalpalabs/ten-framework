@@ -184,8 +184,8 @@ class KalpaTTSClient:
         await self._settled.wait()
         return self._ws is not None
 
-    async def send_text(self, text: str, flush: bool = False) -> float:
-        """Send text, or end the utterance. Returns the monotonic send time."""
+    async def send_text(self, text: str, flush: bool = False) -> None:
+        """Send text, or end the utterance."""
         ws = self._ws
         if ws is None:
             raise KalpaTTSError(
@@ -194,13 +194,10 @@ class KalpaTTSClient:
         payload: dict[str, Any] = {"type": "sendText", "text": text}
         if flush:
             payload["flush"] = True
-        message = json.dumps(payload)
-        sent_at = time.monotonic()
         try:
-            await ws.send(message)
+            await ws.send(json.dumps(payload))
         except ConnectionClosed as exc:
             raise _error_from_close(exc) from exc
-        return sent_at
 
     async def _run(self) -> None:
         failures = 0

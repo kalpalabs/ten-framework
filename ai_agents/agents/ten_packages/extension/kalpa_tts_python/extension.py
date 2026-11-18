@@ -183,6 +183,10 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
         client, self.client = self.client, None
         if client is not None:
             client.stop()
+        if self._ending is not None and not self._ending.done():
+            # A request that was already ending gets its last events before
+            # the base class forgets it, not after.
+            await asyncio.shield(self._ending)
         for request_id in list(self._recorders):
             await self._close_recorder(request_id)
         await super().on_stop(ten_env)
@@ -255,7 +259,10 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
                     )
                     return
                 # The connection was given up on after repeated failures.
-                # A new request is a reason to try again.
+                # A new request is a reason to try again. The old client is
+                # stopped first: its report of the failure may still be on
+                # its way, and it must not reach this request.
+                client.stop()
                 self._start_client()
 
             self._journal(request, t.text or "", t.text_input_end)
@@ -332,11 +339,22 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
                     return
                 text, flush = request.ops[request.sent]
                 replays = request.replays
+                first_text = (
+                    bool(text.strip()) and request.send_started_at is None
+                )
+                if first_text:
+                    # The start of TTFB: the connection is ready and the
+                    # message goes out next. It is set before the send,
+                    # which can still be waiting on a slow socket when the
+                    # audio it asked for arrives.
+                    request.send_started_at = time.monotonic()
                 try:
-                    sent_at = await client.send_text(text, flush)
+                    await client.send_text(text, flush)
                 except KalpaTTSError:
                     # The connection dropped. The client reports it, and the
                     # request is sent again or failed there.
+                    if first_text:
+                        request.send_started_at = None
                     return
                 if request.closed:
                     return
@@ -348,10 +366,6 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
                 if flush:
                     request.flushes_sent += 1
                     self._watch(request)
-                if text.strip() and request.send_started_at is None:
-                    # The connection was ready and the message went out
-                    # right after this time: the start of TTFB.
-                    request.send_started_at = sent_at
                 if request.sent > request.counted:
                     request.counted = request.sent
                     if text.strip():
@@ -444,7 +458,11 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
         request = self._request
         active = request is not None and not request.closed
         if not will_retry:
-            module_error = self._module_error(error, fatal=True)
+            # The key, the account, the voice or the model has to change
+            # before a permanent failure can go away. Connections that kept
+            # failing for another reason are tried again at the next
+            # request, so giving up on them is not fatal.
+            module_error = self._module_error(error, fatal=error.permanent)
             if active:
                 await self._end_request(
                     request, TTSAudioEndReason.ERROR, module_error

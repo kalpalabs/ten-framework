@@ -54,9 +54,9 @@ the [Kalpa documentation](https://docs.kalpalabs.ai/text-to-speech#generation-pa
 - **Errors.** A rejected key, a suspended account, a used-up allowance, an
   unknown voice or model, and invalid session settings are `FATAL_ERROR`;
   the extension does not retry them. Dropped connections and failed
-  generations are `NON_FATAL_ERROR`: the extension reconnects with backoff
-  and gives up with a `FATAL_ERROR` after five consecutive failures, trying
-  again on the next request. A request whose connection drops before any of
+  generations are `NON_FATAL_ERROR`: the extension reconnects with backoff,
+  stops after five consecutive failures, and tries again on the next
+  request. A request whose connection drops before any of
   its audio arrived is sent again, up to twice. So is one that Kalpa refuses
   as `overloaded` (at capacity, nothing generated), on a new connection
   after about one second, then two. One that fails after audio started
