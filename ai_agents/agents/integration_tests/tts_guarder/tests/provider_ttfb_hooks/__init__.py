@@ -12,6 +12,7 @@ HOOKS = {
     "openai_tts2_python": "openai",
     "mistral_tts_python": "mistral",
     "humeai_tts_python": "hume",
+    "kalpa_http_tts": "kalpa_http",
     "google_tts_python": "google",
     "cosy_tts_python": "cosy",
 }

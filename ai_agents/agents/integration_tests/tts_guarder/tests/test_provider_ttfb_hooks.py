@@ -1,5 +1,6 @@
 """Public transport/SDK fixture checks for every second-stage provider hook."""
 
+import asyncio
 from importlib import import_module
 from types import SimpleNamespace
 
@@ -227,3 +228,48 @@ def test_cosy_hook_binds_late_audio_to_original_callback(monkeypatch, clock):
     new_callback.on_data(b"new-audio")
     assert reference.elapsed_ms("first") == 20
     assert reference.elapsed_ms("second") == 30
+
+
+def test_kalpa_http_hook_wraps_the_installed_client_and_restores_it(
+    extension_name, monkeypatch
+):
+    if extension_name != "kalpa_http_tts":
+        pytest.skip("Hook belongs to a different extension")
+    from ten_ai_base.struct import TTS2HttpResponseEventType as Event
+
+    client = import_module(
+        "ten_packages.extension.kalpa_http_tts.kalpa_tts"
+    ).KalpaHttpTTSClient
+
+    async def get(self, text, request_id):
+        # Stands in for Kalpa: no audio for text with nothing to say.
+        if text.strip():
+            yield b"", Event.RESPONSE
+            yield b"audio", Event.RESPONSE
+            yield b"tail", Event.RESPONSE
+        yield None, Event.END
+
+    async def events(text, request_id):
+        return [event async for event in client.get(None, text, request_id)]
+
+    monkeypatch.setattr(client, "get", get)
+    with install_hook("kalpa_http_tts", {}, monkeypatch) as reference:
+        assert client.get is not get
+        reference.begin_request("first")
+        assert asyncio.run(events(" ", "first")) == [(None, Event.END)]
+        # Text without audio leaves the interval open.
+        assert reference.elapsed_ms("first") is None
+        assert asyncio.run(events("Hello.", "first")) == [
+            (b"", Event.RESPONSE),
+            (b"audio", Event.RESPONSE),
+            (b"tail", Event.RESPONSE),
+            (None, Event.END),
+        ]
+        first = reference.elapsed_ms("first")
+        assert first is not None and first >= 0
+        reference.begin_request("second")
+        asyncio.run(events("Again.", "second"))
+        assert reference.elapsed_ms("second") >= 0
+        # Later audio does not move a request's first audio.
+        assert reference.elapsed_ms("first") == first
+    assert client.get is get
