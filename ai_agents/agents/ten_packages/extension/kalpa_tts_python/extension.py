@@ -213,6 +213,18 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
     # ── Input ──────────────────────────────────────────────────────
 
     async def request_tts(self, t: TTSTextInput) -> None:
+        # A flush cancels `current_task`. The work runs in it, so a flush
+        # also ends a wait for a session or for a slow socket, and the next
+        # request is not held up behind it.
+        task = asyncio.create_task(self._request_tts(t))
+        self.current_task = task
+        try:
+            await task
+        finally:
+            if self.current_task is task:
+                self.current_task = None
+
+    async def _request_tts(self, t: TTSTextInput) -> None:
         request_id = t.request_id
         if self._stopped:
             # The base class has dropped its request state; anything emitted

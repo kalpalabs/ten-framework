@@ -159,6 +159,54 @@ def test_a_flush_while_connecting_ends_the_request_and_the_next_one_runs(
     assert not rec.errors()
 
 
+def test_a_flush_while_a_send_is_blocked_ends_the_request(
+    server, config, monkeypatch, running
+):
+    # r1's text is stuck on its way out when the flush comes. The sender
+    # holds the send lock at that moment.
+    blocked = threading.Event()
+    client = running.kalpa_tts.KalpaTTSClient
+    send = client.send_text
+    stuck = [True]
+
+    async def blocked_send(self, text, flush=False):
+        if stuck and text.strip():
+            stuck.clear()
+            blocked.set()
+            await asyncio.sleep(3600)
+        await send(self, text, flush)
+
+    monkeypatch.setattr(client, "send_text", blocked_send)
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", "Stuck on its way out.", end=True)
+        await rec.wait_for(lambda rec: blocked.is_set())
+        await rec.send_flush(ten_env)
+        await rec.wait_for(lambda rec: "tts_flush_end" in rec.names())
+        await rec.send_text(
+            ten_env, "r2", "This one completes.", end=True, turn_id=2
+        )
+        await rec.wait_for(lambda rec: rec.ended("r2"))
+
+    rec = run(config, script)
+
+    # The flush did not wait for the send, and r2 got the lock and a new
+    # session. Nothing of r1 reached Kalpa or came back.
+    assert rec.ends() == [
+        ("r1", END_REASON_INTERRUPTED),
+        ("r2", END_REASON_REQUEST_END),
+    ]
+    first = rec.of("tts_audio_end")[0]
+    assert first["request_event_interval_ms"] == 0
+    assert first["request_total_audio_duration_ms"] == 0
+    assert rec.index("tts_audio_end") < rec.index("tts_flush_end")
+    assert server.utterances == ["This one completes."]
+    assert [e["request_id"] for e in rec.of("tts_audio_start")] == ["r2"]
+    assert bytes(rec.audio) == AUDIO
+    assert len(server.sessions) == 2
+    assert not rec.errors()
+
+
 def test_a_second_flush_leaves_the_new_session_alone(server, config):
     server.holds = [1]
 
