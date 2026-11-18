@@ -134,6 +134,19 @@ class KalpaTTSConfig(BaseModel):
                 f"'sample_rate' must be one of "
                 f"{', '.join(str(rate) for rate in SAMPLE_RATES)}."
             )
+        # No retry can open an address that is not a WebSocket one. The
+        # address itself is not quoted: it may hold a key.
+        try:
+            parts = urlsplit(self.websocket_url)
+            usable = parts.scheme in ("ws", "wss") and bool(parts.hostname)
+            _ = parts.port
+        except ValueError:
+            usable = False
+        if not usable:
+            raise ValueError(
+                "The endpoint ('url' or 'base_url') must be a ws:// or "
+                "wss:// address."
+            )
 
     @property
     def websocket_url(self) -> str:

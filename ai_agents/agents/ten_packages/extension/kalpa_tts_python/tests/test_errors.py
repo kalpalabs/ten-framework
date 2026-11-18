@@ -479,6 +479,33 @@ def test_an_unsupported_sample_rate_is_fatal_before_any_connection(server):
     assert server.sessions == []
 
 
+def test_an_endpoint_that_is_not_a_websocket_address_is_fatal_at_startup(
+    server,
+):
+    async def script(rec, ten_env):
+        await rec.wait_for(lambda rec: rec.errors())
+        await rec.send_text(ten_env, "r1", "Hello world.", end=True)
+        await rec.wait_for(lambda rec: len(rec.errors()) >= 2)
+
+    rec = run(
+        {
+            "params": {
+                "api_key": API_KEY,
+                "base_url": server.url.replace("ws://", "http://"),
+            }
+        },
+        script,
+    )
+
+    # Once at startup and once for the request; nothing is retried.
+    assert [(e["id"], e["code"]) for e in rec.errors()] == [
+        ("", FATAL_ERROR),
+        ("r1", FATAL_ERROR),
+    ]
+    assert all("endpoint" in e["message"] for e in rec.errors())
+    assert server.sessions == []
+
+
 def test_frames_that_are_not_kalpa_messages_are_ignored(server, config):
     # Text that is not JSON, JSON that is not an object, a binary frame,
     # audio that is not base64 and a message type the client does not know.

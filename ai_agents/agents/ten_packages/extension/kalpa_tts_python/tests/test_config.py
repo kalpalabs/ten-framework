@@ -174,6 +174,23 @@ def test_logged_config_hides_the_key():
     assert KEY in config.to_str(sensitive_handling=False)
 
 
+@pytest.mark.parametrize(
+    "setting",
+    [
+        {"base_url": "https://api.kalpalabs.ai"},
+        {"base_url": "api.kalpalabs.ai"},
+        {"base_url": "wss://"},
+        {"base_url": "wss://api.kalpalabs.ai:port"},
+        {"url": f"http://example.test/tts?token={KEY}"},
+    ],
+)
+def test_an_endpoint_that_is_not_a_websocket_address_is_rejected(setting):
+    config = load({"params": {"api_key": KEY, **setting}})
+    with pytest.raises(ValueError, match="endpoint") as raised:
+        config.check()
+    assert KEY not in str(raised.value)
+
+
 def test_the_endpoint_is_logged_and_reported_without_credentials():
     config = load(
         {
