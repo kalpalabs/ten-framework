@@ -39,8 +39,8 @@ class Recording(AsyncExtensionTester):
         self._done = done
         self._timeout_s = timeout_s
         self._tasks: list[asyncio.Task] = []
-        # Everything received, in order: `(name, payload)`. Audio frames
-        # appear as `("pcm_frame", {"bytes": n, "sample_rate": hz})`.
+        # Everything received, in order: `(name, payload)`. An audio frame
+        # appears as `("pcm_frame", {...})` with its size and format.
         self.events: list[tuple[str, dict[str, Any]]] = []
         self.audio = bytearray()
 
@@ -58,8 +58,29 @@ class Recording(AsyncExtensionTester):
             end["request_id"] == request_id for end in self.of("tts_audio_end")
         )
 
+    def ends(self) -> list[tuple[str, int]]:
+        return [
+            (end["request_id"], end["reason"])
+            for end in self.of("tts_audio_end")
+        ]
+
     def errors(self) -> list[dict[str, Any]]:
         return self.of("error")
+
+    def usage(self) -> list[tuple[int, int]]:
+        """The usage reports of requests: `(turn_id, output_characters)`.
+
+        The base class sends one more, for no request, when it stops.
+        """
+        return [
+            (
+                metric["metadata"]["turn_id"],
+                metric["metrics"]["output_characters"],
+            )
+            for metric in self.of("metrics")
+            if "output_characters" in metric.get("metrics", {})
+            and "turn_id" in metric.get("metadata", {})
+        ]
 
     def ttfb(self) -> list[int]:
         return [
@@ -167,6 +188,8 @@ class Recording(AsyncExtensionTester):
                 {
                     "bytes": len(pcm),
                     "sample_rate": audio_frame.get_sample_rate(),
+                    "channels": audio_frame.get_number_of_channels(),
+                    "bytes_per_sample": audio_frame.get_bytes_per_sample(),
                 },
             )
         )

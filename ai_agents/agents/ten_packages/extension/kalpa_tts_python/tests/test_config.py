@@ -4,15 +4,19 @@
 # See the LICENSE file for more information.
 #
 import pytest
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
 
 from ten_packages.extension.kalpa_tts_python.config import (
     DEFAULT_MODEL,
     DEFAULT_SAMPLE_RATE,
     DEFAULT_VOICE_ID,
+    SAMPLE_RATES,
     KalpaTTSConfig,
 )
 from ten_packages.extension.kalpa_tts_python.extension import _split
 from ten_packages.extension.kalpa_tts_python.kalpa_tts import (
+    _error_from_close,
     _error_from_message,
 )
 
@@ -61,6 +65,46 @@ def test_missing_key_or_voice_is_rejected():
         load({"params": {"api_key": KEY}, "voice_id": ""}).check()
 
 
+def test_empty_voice_and_model_in_params_fall_back_to_the_defaults():
+    config = load({"params": {"api_key": KEY, "voice_id": "", "model": None}})
+    config.check()
+    assert config.voice_id == DEFAULT_VOICE_ID
+    assert config.model == DEFAULT_MODEL
+    assert config.params == {}
+
+
+def test_every_sample_rate_kalpa_offers_is_accepted():
+    for rate in SAMPLE_RATES:
+        config = load({"params": {"api_key": KEY, "sample_rate": rate}})
+        config.check()
+        assert config.session_message()["sample_rate"] == rate
+
+
+@pytest.mark.parametrize(
+    "value", [True, "fast", 24000.5, 0, -24000, 12345, None, [24000]]
+)
+def test_any_other_sample_rate_is_rejected(value):
+    with pytest.raises(ValueError, match="sample_rate"):
+        load({"params": {"api_key": KEY, "sample_rate": value}}).check()
+    with pytest.raises(ValueError, match="sample_rate"):
+        load({"sample_rate": value, "params": {"api_key": KEY}}).check()
+
+
+@pytest.mark.parametrize(
+    "value", ["80", 80, [50, "soon"], [True], {"first": 50}]
+)
+def test_a_malformed_chunk_schedule_is_rejected(value):
+    with pytest.raises(ValueError, match="chunk_length_schedule"):
+        load({"params": {"api_key": KEY, "chunk_length_schedule": value}})
+
+
+@pytest.mark.parametrize("value", [None, []])
+def test_an_empty_chunk_schedule_leaves_the_choice_to_kalpa(value):
+    config = load({"params": {"api_key": KEY, "chunk_length_schedule": value}})
+    assert config.session_message()["generation_config"] == {}
+    assert "params" not in config.session_message()
+
+
 def test_session_settings_leave_params_and_the_rest_is_passed_through():
     config = load(
         {
@@ -90,32 +134,31 @@ def test_session_settings_leave_params_and_the_rest_is_passed_through():
 
 def test_endpoint_precedence():
     base = {"api_key": KEY, "voice_id": "v1"}
-    top = load(
+    nested = load(
         {
-            "url": "wss://top.example/tts/{voice_id}",
+            "url": "wss://top.example/tts",
             "params": {
                 **base,
-                "url": "wss://nested.example/tts",
+                "url": "wss://nested.example/tts/{voice_id}",
                 "base_url": "wss://base.example",
             },
         }
     )
-    assert top.websocket_url == "wss://top.example/tts/v1"
+    assert nested.websocket_url == "wss://nested.example/tts/v1"
 
-    nested = load(
+    # A blank `params.url` is no endpoint.
+    top = load(
         {
-            "params": {
-                **base,
-                "url": "wss://nested.example/tts",
-                "base_url": "wss://base.example",
-            }
+            "url": "wss://top.example/tts",
+            "params": {**base, "url": " ", "base_url": "wss://base.example"},
         }
     )
-    assert nested.websocket_url == "wss://nested.example/tts"
+    assert top.websocket_url == "wss://top.example/tts"
 
     from_base = load({"params": {**base, "base_url": "wss://base.example/"}})
     assert from_base.websocket_url == "wss://base.example/v1/tts/v1/stream"
     # The endpoint is never sent to Kalpa as a generation parameter.
+    assert "params" not in nested.session_message()
     assert "params" not in top.session_message()
 
 
@@ -129,6 +172,23 @@ def test_logged_config_hides_the_key():
     logged = config.to_str(sensitive_handling=True)
     assert KEY not in logged
     assert KEY in config.to_str(sensitive_handling=False)
+
+
+def test_the_endpoint_is_logged_and_reported_without_credentials():
+    config = load(
+        {
+            "url": f"wss://user:{KEY}@example.test:8443/tts/{{voice_id}}"
+            f"?token={KEY}#{KEY}",
+            "params": {"api_key": KEY},
+        }
+    )
+    assert config.safe_url == f"wss://example.test:8443/tts/{DEFAULT_VOICE_ID}"
+    assert KEY not in config.to_str(sensitive_handling=True)
+    # The connection itself still uses the address as it was given.
+    assert KEY in config.websocket_url
+
+    local = load({"params": {"api_key": KEY, "base_url": "ws://[::1]:9000/"}})
+    assert local.safe_url == f"ws://[::1]:9000/v1/tts/{DEFAULT_VOICE_ID}/stream"
 
 
 def test_long_text_is_cut_at_a_space():
@@ -155,3 +215,33 @@ def test_error_classification():
     failed = _error_from_message(error("inference_error", response_id="r1"))
     assert not failed.permanent
     assert failed.response_id == "r1"
+
+
+@pytest.mark.parametrize(
+    "code,error_type",
+    [
+        (4401, "authentication_error"),
+        (4402, "allowance_exhausted"),
+        (4403, "account_suspended"),
+        (4404, "not_found"),
+    ],
+)
+def test_close_codes_that_no_reconnect_can_fix(code, error_type):
+    error = _error_from_close(ConnectionClosedError(Close(code, ""), None))
+    assert error.permanent
+    assert (error.error_type, error.code) == (error_type, code)
+
+
+def test_other_close_codes_are_worth_a_reconnect():
+    for code in (1011, 4429):
+        error = _error_from_close(
+            ConnectionClosedError(Close(code, "try again"), None)
+        )
+        assert not error.permanent
+        assert (error.error_type, error.code) == ("connection_closed", code)
+        assert error.message == "try again"
+    # Session settings Kalpa refuses are refused again. The same code on
+    # an open session is one rejected message.
+    refused = ConnectionClosedError(Close(4400, "invalid_request"), None)
+    assert _error_from_close(refused, opening=True).permanent
+    assert not _error_from_close(refused).permanent

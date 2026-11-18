@@ -5,12 +5,14 @@
 #
 """Client for the Kalpa streaming text-to-speech WebSocket.
 
-Protocol: https://docs.kalpalabs.ai/text-to-speech
-(`WSS /v1/tts/{voice_id}/stream`). One connection speaks in one voice. The
-API key rides the first message, `initializeConnection`, which the server
-answers with `sessionCreated`. Text arrives in `sendText` messages; one with
-`flush: true` ends the utterance. Audio comes back as base64 16-bit PCM in
-`responseAudio`, and `responseDone` ends the utterance's audio.
+Protocol: `WSS /v1/tts/{voice_id}/stream`,
+https://docs.kalpalabs.ai/reference#wss-v1-tts-voice-id-stream
+
+One connection speaks in one voice. The API key rides the first message,
+`initializeConnection`, which the server answers with `sessionCreated`. Text
+arrives in `sendText` messages; one with `flush: true` ends the utterance.
+Audio comes back as base64 16-bit PCM in `responseAudio`, and `responseDone`
+ends the utterance's audio.
 """
 import asyncio
 import base64
@@ -35,6 +37,9 @@ KEEPALIVE_INTERVAL_S = 60.0
 MAX_CONNECT_ATTEMPTS = 5
 RECONNECT_BASE_DELAY_S = 0.5
 RECONNECT_MAX_DELAY_S = 8.0
+# A session that stayed open this long, or delivered a message, worked: one
+# that ends sooner without either counts as another failed connection.
+STABLE_SESSION_S = 10.0
 # Kalpa refuses to start an utterance while it is at capacity. Nothing was
 # generated, so the request can be sent again: after about a second, then
 # twice as long for each refusal in a row.
@@ -153,7 +158,8 @@ class KalpaTTSClient:
         # every state in which waiting longer changes nothing.
         self._settled = asyncio.Event()
         self.failed: KalpaTTSError | None = None
-        # Whether the current connection has delivered any audio.
+        # Whether the current connection has delivered a message, and audio.
+        self._heard = False
         self._heard_audio = False
 
     def start(self) -> None:
@@ -200,13 +206,16 @@ class KalpaTTSClient:
         failures = 0
         # Connections in a row that ended with an `overloaded` refusal.
         overloads = 0
+        loop = asyncio.get_running_loop()
         while not self._stopped:
             ws = None
+            opened_at = 0.0
+            self._heard = False
             self._heard_audio = False
             try:
                 await self._emit("on_connecting")
                 ws = await self._open_session()
-                failures = 0
+                opened_at = loop.time()
                 self._ws = ws
                 self._settled.set()
                 await self._emit("on_connected")
@@ -215,8 +224,12 @@ class KalpaTTSClient:
             except KalpaTTSError as exc:
                 error = exc
             except (OSError, asyncio.TimeoutError, WebSocketException) as exc:
+                # The library may quote the address, which can hold a key.
                 error = KalpaTTSError(
-                    "connection_error", str(exc) or type(exc).__name__
+                    "connection_error",
+                    (str(exc) or type(exc).__name__).replace(
+                        self._config.websocket_url, self._config.safe_url
+                    ),
                 )
             finally:
                 self._ws = None
@@ -228,6 +241,13 @@ class KalpaTTSClient:
             if self._stopped:
                 return
 
+            if ws is not None and (
+                self._heard or loop.time() - opened_at >= STABLE_SESSION_S
+            ):
+                # The session worked, so the failures in a row start again.
+                # One that Kalpa opens and drops at once does not: such
+                # connections are given up on like any other.
+                failures = 0
             failures += 1
             if error.error_type != OVERLOADED:
                 overloads = 0
@@ -317,6 +337,7 @@ class KalpaTTSClient:
                     )
                     continue
 
+                self._heard = True
                 kind = message.get("type")
                 if kind == "responseAudio":
                     pcm = _decode_audio(message.get("pcm_b64"))

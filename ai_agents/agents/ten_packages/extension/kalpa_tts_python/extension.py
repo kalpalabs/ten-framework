@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import os
 import time
 import traceback
+from typing import Awaitable
 
 from pydantic import ValidationError
 
@@ -34,8 +35,13 @@ MAX_UTTERANCE_CHARS = 8000
 # Times one request is sent again after its connection dropped, or Kalpa
 # refused it as overloaded, before any of its audio arrived.
 MAX_REPLAYS = 2
-# Failed request ids remembered, to recognize their input arriving late.
+# Failed and interrupted requests remembered, to recognize their input
+# arriving late.
 MAX_ENDED_REQUESTS = 64
+# How long Kalpa may send nothing for an utterance it was asked to speak. A
+# response that never ends would otherwise hold up every request behind it
+# until the next flush.
+RESPONSE_TIMEOUT_S = 30.0
 
 
 def _split(text: str, limit: int) -> list[str]:
@@ -57,24 +63,36 @@ class _Request:
     # Every message of the request, `(text, flush)`, in order. It is kept so
     # the request can be sent again on a new connection.
     ops: list[tuple[str, bool]] = field(default_factory=list)
-    # Messages of `ops` already sent on the current connection.
+    # Messages of `ops` already sent on the current connection, and how
+    # many of them have been counted as usage. A request that is sent
+    # again is counted once.
     sent: int = 0
+    counted: int = 0
     # Characters in the utterance that is still open.
     open_chars: int = 0
     # Supplies the space after a sentence that the next piece would bring.
     spacing: SentenceSpacing = field(default_factory=SentenceSpacing)
-    # Utterances ended, and how many of them Kalpa has finished speaking.
+    # Utterances ended, how many of those ends the current connection has
+    # had, and how many utterances Kalpa has finished speaking.
     flushes: int = 0
+    flushes_sent: int = 0
     done: int = 0
+    # Runs out when Kalpa owes audio and sends nothing.
+    deadline: asyncio.TimerHandle | None = None
     input_ended: bool = False
     replays: int = 0
-    # Monotonic times of the first text sent and of `tts_audio_start`.
+    # Monotonic times of the first text sent, of the first audio received
+    # and of `tts_audio_start`.
     send_started_at: float | None = None
+    first_audio_at: float | None = None
     audio_started_at: float | None = None
+    # Bytes sent downstream, and the bytes of a sample that is not whole yet.
     audio_bytes: int = 0
+    carry: bytes = b""
     # Set once the request has ended. Nothing is emitted for it afterwards,
     # except by the task that ends it.
     closed: bool = False
+    end_reason: TTSAudioEndReason | None = None
     end_task: asyncio.Task | None = None
 
 
@@ -99,8 +117,8 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
         self.config: KalpaTTSConfig | None = None
         self.client: KalpaTTSClient | None = None
         self._request: _Request | None = None
-        # Ids of requests that ended in an error, oldest first.
-        self._ended: dict[str, None] = {}
+        # Requests that failed or were interrupted, by id, oldest first.
+        self._ended: dict[str, _Request] = {}
         self._recorders: dict[str, PCMWriter] = {}
         # One sender at a time keeps a request's messages in order when a
         # reconnect sends them again while new input is arriving.
@@ -161,6 +179,7 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
         request, self._request = self._request, None
         if request is not None:
             request.closed = True
+            self._watch(request)
         client, self.client = self.client, None
         if client is not None:
             client.stop()
@@ -175,7 +194,7 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
         if self.config is None:
             return {}
         return {
-            "url": self.config.websocket_url,
+            "url": self.config.safe_url,
             "model": self.config.model,
             "voice_id": self.config.voice_id,
         }
@@ -196,13 +215,17 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
             # now would go out without the request's metadata.
             return
         try:
-            if request_id in self._ended:
-                # More input for a request that failed before its
-                # `text_input_end`. The base class has made it the active
-                # request again; release it so the next one can start.
-                await self.finish_request(
-                    request_id, reason=TTSAudioEndReason.ERROR
-                )
+            ended = self._ended.get(request_id)
+            if ended is not None:
+                # More input for a request that is over: the rest of a
+                # reply that failed part-way, or text that was on its way
+                # when the flush came. Nothing of it is spoken. The base
+                # class has made it the active request again, so it is
+                # released for the next one to start. That waits for the
+                # request's last events, because the session that replaces
+                # its own is started among them.
+                await asyncio.shield(ended.end_task)
+                await self.finish_request(request_id, reason=ended.end_reason)
                 return
 
             request = self._request
@@ -266,8 +289,6 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
             previous.closed = True
         request = _Request(request_id)
         self._request = request
-        # A request that ended on half a sample must not shift this one.
-        self.leftover_bytes = b""
         if self.config is not None and self.config.dump:
             os.makedirs(self.config.dump_path, exist_ok=True)
             self._recorders[request_id] = PCMWriter(
@@ -324,15 +345,20 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
                     # the request starts over on the next one.
                     continue
                 request.sent += 1
-                if text.strip():
-                    if request.send_started_at is None:
-                        # The connection was ready and the message went out
-                        # right after this time: the start of TTFB.
-                        request.send_started_at = sent_at
-                    self.metrics_add_output_characters(len(text))
-                    await self.send_tts_request_metrics(
-                        request_id=request.request_id, request_text=text
-                    )
+                if flush:
+                    request.flushes_sent += 1
+                    self._watch(request)
+                if text.strip() and request.send_started_at is None:
+                    # The connection was ready and the message went out
+                    # right after this time: the start of TTFB.
+                    request.send_started_at = sent_at
+                if request.sent > request.counted:
+                    request.counted = request.sent
+                    if text.strip():
+                        self.metrics_add_output_characters(len(text))
+                        await self.send_tts_request_metrics(
+                            request_id=request.request_id, request_text=text
+                        )
 
     # ── Events from the client ─────────────────────────────────────
 
@@ -345,6 +371,18 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
         request = self._request
         if request is None or request.closed:
             return
+        self._watch(request)
+        if request.first_audio_at is None:
+            request.first_audio_at = received_at
+        # Kalpa's chunks may end inside a sample. Only whole samples go on,
+        # so the dump and the reported duration are those of the audio sent
+        # downstream, also when the request ends on half a sample.
+        pcm = request.carry + pcm
+        whole = len(pcm) - len(pcm) % self._sample_bytes()
+        request.carry, pcm = pcm[whole:], pcm[:whole]
+        if not pcm:
+            return
+
         if request.audio_started_at is None:
             request.audio_started_at = time.monotonic()
             await self.send_tts_audio_start(request_id=request.request_id)
@@ -352,7 +390,11 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
                 return
             if request.send_started_at is not None:
                 ttfb_ms = max(
-                    0, round((received_at - request.send_started_at) * 1000)
+                    0,
+                    round(
+                        (request.first_audio_at - request.send_started_at)
+                        * 1000
+                    ),
                 )
                 await self.send_tts_ttfb_metrics(
                     request_id=request.request_id, ttfb_ms=ttfb_ms
@@ -365,8 +407,7 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
             await recorder.write(pcm)
             if request.closed:
                 return
-        # Counted and sent with nothing in between, so the reported duration
-        # is the duration of the audio that went downstream.
+        # Counted and sent with nothing in between.
         request.audio_bytes += len(pcm)
         self.metrics_add_recv_audio_chunks(pcm)
         await self.send_tts_audio_data(pcm)
@@ -385,6 +426,7 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
             )
             return
         request.done += 1
+        self._watch(request)
         await self._complete_if_done(request)
 
     async def on_response_error(self, error: KalpaTTSError) -> None:
@@ -434,7 +476,11 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
         # once the new session is ready.
         request.replays += 1
         request.sent = 0
+        request.flushes_sent = 0
         request.done = 0
+        request.first_audio_at = None
+        request.carry = b""
+        self._watch(request)
         await self.send_tts_error(
             request_id=request.request_id,
             error=self._module_error(error, fatal=False),
@@ -443,9 +489,6 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
     # ── Ending a request ───────────────────────────────────────────
 
     async def cancel_tts(self) -> None:
-        # The base class forgets every request on a flush, so an id seen
-        # after it is a new request.
-        self._ended.clear()
         request = self._request
         if request is not None:
             # A new session, so text Kalpa has not spoken and audio not yet
@@ -482,6 +525,40 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
             replace_client=True,
         )
 
+    def _watch(self, request: _Request) -> None:
+        """Restart the deadline, or drop it when Kalpa owes no audio.
+
+        Kalpa owes audio from the end of an utterance to its `responseDone`.
+        Before that it may be waiting for the rest of a sentence.
+        """
+        if request.deadline is not None:
+            request.deadline.cancel()
+            request.deadline = None
+        if not request.closed and request.done < request.flushes_sent:
+            request.deadline = asyncio.get_running_loop().call_later(
+                RESPONSE_TIMEOUT_S, self._on_response_timeout, request
+            )
+
+    def _on_response_timeout(self, request: _Request) -> None:
+        request.deadline = None
+        if request.closed:
+            return
+        error = KalpaTTSError(
+            "response_timeout",
+            f"Kalpa sent nothing for {RESPONSE_TIMEOUT_S:g} seconds",
+        )
+        self.ten_env.log_error(
+            f"vendor_error: {error.error_type}: {error.message}",
+            category=LOG_CATEGORY_VENDOR,
+        )
+        # The request is not sent again: the listener has already waited.
+        self._close_request(
+            request,
+            TTSAudioEndReason.ERROR,
+            self._module_error(error, fatal=False),
+            replace_client=True,
+        )
+
     async def _end_request(
         self,
         request: _Request,
@@ -490,16 +567,28 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
         replace_client: bool = False,
     ) -> None:
         """End the request once. The events survive a cancelled caller."""
+        await asyncio.shield(
+            self._close_request(request, reason, error, replace_client)
+        )
+
+    def _close_request(
+        self,
+        request: _Request,
+        reason: TTSAudioEndReason,
+        error: ModuleError | None,
+        replace_client: bool,
+    ) -> asyncio.Task:
+        """Close the request and return the task that emits its last events.
+
+        Nothing here waits: once it returns, nothing else is emitted for
+        the request, and a client that was replaced delivers nothing more.
+        """
         if request.end_task is None:
-            # Everything up to the task runs without a pause: from here on
-            # nothing else is emitted for the request, and a client that is
-            # replaced can no longer deliver anything.
             request.closed = True
+            request.end_reason = reason
+            self._watch(request)
             if self._request is request:
                 self._request = None
-            if reason == TTSAudioEndReason.ERROR:
-                # Its remaining input may still arrive.
-                self._remember_ended(request.request_id)
             client = None
             if replace_client:
                 client, self.client = self.client, None
@@ -509,7 +598,14 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
                 self._emit_end(request, reason, error, client is not None)
             )
             self._ending = request.end_task
-        await asyncio.shield(request.end_task)
+            if reason != TTSAudioEndReason.REQUEST_END:
+                # Its remaining input may still arrive. A request that
+                # ended normally is not remembered: an agent may speak
+                # again under the same id.
+                if len(self._ended) >= MAX_ENDED_REQUESTS:
+                    self._ended.pop(next(iter(self._ended)))
+                self._ended[request.request_id] = request
+        return request.end_task
 
     async def _emit_end(
         self,
@@ -518,50 +614,76 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
         error: ModuleError | None,
         client_stopped: bool,
     ) -> None:
+        """Emit the last events of a request.
+
+        Each step runs even if the one before it failed, so a failure to
+        report cannot leave the extension without a session or the base
+        class waiting for a request that is over.
+        """
         request_id = request.request_id
         if self._stopped:
             return
-        try:
-            if client_stopped:
-                await self.on_disconnected(
+        if client_stopped:
+            await self._attempt(
+                "report the disconnect",
+                self.on_disconnected(
                     code=0,
                     message=(
                         "flush"
                         if reason == TTSAudioEndReason.INTERRUPTED
                         else "request failed"
                     ),
-                )
-                if not self._stopped:
-                    # Started before the base class is told the request is
-                    # over, so the next request waits for this session.
-                    self._start_client()
-            if error is not None:
-                await self.send_tts_error(request_id=request_id, error=error)
-            await self._close_recorder(request_id)
-            # A request that failed before any audio has no audio to end.
-            if (
-                reason != TTSAudioEndReason.ERROR
-                or request.audio_started_at is not None
-            ):
-                await self.send_tts_audio_end(
-                    request_id=request_id,
-                    request_event_interval_ms=self._interval_ms(request),
-                    request_total_audio_duration_ms=self._duration_ms(request),
-                    reason=reason,
-                )
-                await self.send_usage_metrics(request_id)
-            # After a flush the base class clears the request itself.
-            if reason != TTSAudioEndReason.INTERRUPTED:
-                await self.finish_request(request_id, reason=reason)
-        except Exception:
-            self.ten_env.log_error(
-                f"Ending request {request_id} failed: {traceback.format_exc()}"
+                ),
+            )
+            if not self._stopped:
+                # Started before the base class is told the request is
+                # over, so the next request waits for this session.
+                self._start_client()
+        if error is not None:
+            await self._attempt(
+                "report the error",
+                self.send_tts_error(request_id=request_id, error=error),
+            )
+        await self._close_recorder(request_id)
+        # A request that failed before any audio has no audio to end.
+        if (
+            reason != TTSAudioEndReason.ERROR
+            or request.audio_started_at is not None
+        ):
+            await self._attempt(
+                "send the audio end", self._send_audio_end(request, reason)
+            )
+        elif request.counted:
+            # Its text still went to Kalpa. Reported here, it is not added
+            # to the usage of the next request.
+            await self._attempt(
+                "report the usage", self.send_usage_metrics(request_id)
+            )
+        # After a flush the base class clears the request itself.
+        if reason != TTSAudioEndReason.INTERRUPTED:
+            await self._attempt(
+                "finish the request",
+                self.finish_request(request_id, reason=reason),
             )
 
-    def _remember_ended(self, request_id: str) -> None:
-        if len(self._ended) >= MAX_ENDED_REQUESTS:
-            self._ended.pop(next(iter(self._ended)))
-        self._ended[request_id] = None
+    async def _attempt(self, what: str, step: Awaitable[None]) -> None:
+        try:
+            await step
+        except Exception:
+            self.ten_env.log_error(
+                f"Failed to {what}: {traceback.format_exc()}"
+            )
+
+    async def _send_audio_end(
+        self, request: _Request, reason: TTSAudioEndReason
+    ) -> None:
+        await self.send_tts_audio_end(
+            request_id=request.request_id,
+            request_event_interval_ms=self._interval_ms(request),
+            request_total_audio_duration_ms=self._duration_ms(request),
+            reason=reason,
+        )
+        await self.send_usage_metrics(request.request_id)
 
     async def _close_recorder(self, request_id: str) -> None:
         recorder = self._recorders.pop(request_id, None)
@@ -581,11 +703,15 @@ class KalpaTTSExtension(AsyncTTS2BaseExtension):
             return 0
         return int((time.monotonic() - request.audio_started_at) * 1000)
 
+    def _sample_bytes(self) -> int:
+        return (
+            self.synthesize_audio_sample_width()
+            * self.synthesize_audio_channels()
+        )
+
     def _duration_ms(self, request: _Request) -> int:
         bytes_per_second = (
-            self.synthesize_audio_sample_rate()
-            * self.synthesize_audio_sample_width()
-            * self.synthesize_audio_channels()
+            self.synthesize_audio_sample_rate() * self._sample_bytes()
         )
         return int(request.audio_bytes * 1000 / bytes_per_second)
 

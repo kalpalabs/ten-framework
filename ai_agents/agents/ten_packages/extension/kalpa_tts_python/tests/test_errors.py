@@ -3,6 +3,9 @@
 # Licensed under the Apache License, Version 2.0.
 # See the LICENSE file for more information.
 #
+import asyncio
+import threading
+
 from harness import (
     END_REASON_ERROR,
     END_REASON_REQUEST_END,
@@ -10,7 +13,7 @@ from harness import (
     NON_FATAL_ERROR,
     run,
 )
-from mock_server import AUDIO, CHUNKS
+from mock_server import API_KEY, AUDIO, CHUNKS
 
 SECRET = "sk-live-not-a-real-key-0123456789"
 
@@ -240,3 +243,232 @@ def test_a_request_refused_on_every_attempt_ends_with_an_error(server, config):
     assert len(gaps) == 3
     assert gaps[0] >= 1.0 and gaps[1] >= 2.0 and gaps[2] >= 4.0
     assert server.sessions[-1]["utterances"] == ["The next request."]
+
+
+def test_a_response_that_never_starts_fails_its_request(
+    server, config, monkeypatch, running
+):
+    monkeypatch.setattr(running.extension, "RESPONSE_TIMEOUT_S", 0.3)
+    # Kalpa takes the text and then sends nothing.
+    server.holds = [0]
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", "Never answered.", end=True)
+        await rec.send_text(
+            ten_env, "r2", "The next request.", end=True, turn_id=2
+        )
+        await rec.wait_for(lambda rec: rec.ended("r2"))
+
+    rec = run(config, script)
+
+    assert _error_codes(rec.errors()) == [
+        ("r1", NON_FATAL_ERROR, "response_timeout")
+    ]
+    # No audio started for r1, so it has no audio end. r2 was not held up.
+    assert rec.ends() == [("r2", END_REASON_REQUEST_END)]
+    assert bytes(rec.audio) == AUDIO
+    # r2 ran on a session that never held r1.
+    assert [s["utterances"] for s in server.sessions] == [
+        ["Never answered."],
+        ["The next request."],
+    ]
+
+
+def test_a_response_that_stalls_after_some_audio_fails_its_request(
+    server, config, monkeypatch, running
+):
+    monkeypatch.setattr(running.extension, "RESPONSE_TIMEOUT_S", 1.0)
+    server.holds = [1]
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", "Stops part-way.", end=True)
+        await rec.send_text(
+            ten_env, "r2", "The next request.", end=True, turn_id=2
+        )
+        await rec.wait_for(lambda rec: rec.ended("r2"))
+
+    rec = run(config, script)
+
+    assert _error_codes(rec.errors()) == [
+        ("r1", NON_FATAL_ERROR, "response_timeout")
+    ]
+    assert rec.ends() == [
+        ("r1", END_REASON_ERROR),
+        ("r2", END_REASON_REQUEST_END),
+    ]
+    assert rec.of("tts_audio_end")[0]["request_total_audio_duration_ms"] == 20
+    assert bytes(rec.audio) == CHUNKS[0][:-1] + AUDIO
+
+
+def test_the_deadline_runs_only_while_kalpa_is_silent_and_owes_audio(
+    server, config, monkeypatch, running
+):
+    monkeypatch.setattr(running.extension, "RESPONSE_TIMEOUT_S", 1.0)
+    # The response takes 1.5 seconds, longer than the deadline, but each
+    # chunk comes well within it.
+    server.chunks = CHUNKS * 2
+    server.chunk_delay_s = 0.25
+
+    async def script(rec, ten_env):
+        # Until the text ends, Kalpa may be waiting for the rest of it.
+        await rec.send_text(ten_env, "r1", "Half a sentence")
+        await asyncio.sleep(1.3)
+        await rec.send_text(ten_env, "r1", " and the rest.", end=True)
+        await rec.wait_for(lambda rec: rec.ended("r1"))
+
+    rec = run(config, script)
+
+    assert not rec.errors()
+    assert rec.ends() == [("r1", END_REASON_REQUEST_END)]
+    assert bytes(rec.audio) == AUDIO * 2
+
+
+def test_late_input_waits_until_the_failed_request_has_ended(
+    server, config, monkeypatch, running
+):
+    # r1 fails while its text is still arriving, and its last events take
+    # a while: the session is replaced among them.
+    ending = threading.Event()
+    extension = running.extension.KalpaTTSExtension
+    report = extension.on_disconnected
+
+    async def slow_report(self, *args, **kwargs):
+        ending.set()
+        await asyncio.sleep(0.3)
+        await report(self, *args, **kwargs)
+
+    monkeypatch.setattr(extension, "on_disconnected", slow_report)
+    server.fail_responses = 1
+    sentence = "This sentence is repeated to fill more than one utterance. "
+
+    async def script(rec, ten_env):
+        # 8,850 characters: the first utterance ends, and fails, before
+        # the request does.
+        await rec.send_text(ten_env, "r1", sentence * 150)
+        await rec.wait_for(lambda rec: ending.is_set())
+        await rec.send_text(ten_env, "r1", " Late text for it.", end=True)
+        await rec.send_text(
+            ten_env, "r2", "The next request.", end=True, turn_id=2
+        )
+        await rec.wait_for(lambda rec: rec.ended("r2"))
+
+    rec = run(config, script)
+
+    # r2 found the new session in place; it did not fail as well.
+    assert _error_codes(rec.errors()) == [
+        ("r1", NON_FATAL_ERROR, "inference_error")
+    ]
+    assert rec.ends() == [
+        ("r1", END_REASON_ERROR),
+        ("r2", END_REASON_REQUEST_END),
+    ]
+    assert server.sessions[-1]["utterances"] == ["The next request."]
+    assert bytes(rec.audio) == CHUNKS[0][:-1] + AUDIO
+
+
+def test_connections_that_keep_failing_are_given_up_on_until_a_new_request(
+    server, config, monkeypatch, running
+):
+    monkeypatch.setattr(running.kalpa_tts, "RECONNECT_BASE_DELAY_S", 0.01)
+    server.fail_sessions = 5
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", "Never gets through.", end=True)
+        await rec.wait_for(
+            lambda rec: any(e["code"] == FATAL_ERROR for e in rec.errors())
+        )
+        await rec.send_text(
+            ten_env, "r2", "The next request.", end=True, turn_id=2
+        )
+        await rec.wait_for(lambda rec: rec.ended("r2"))
+
+    rec = run(config, script)
+
+    # The fifth failure in a row ends the retries, once, with a fatal error.
+    # Before it r1 was sent again and then failed; how many of the failures
+    # it saw depends on when it arrived.
+    codes = _error_codes(rec.errors())
+    assert [code for _, code, _ in codes].count(FATAL_ERROR) == 1
+    assert codes[-1][1:] == (FATAL_ERROR, "connection_closed")
+    assert set(codes[:-1]) == {("r1", NON_FATAL_ERROR, "connection_closed")}
+    # r1 had no audio, so no audio end. A new request is a reason to
+    # connect again, and it completes.
+    assert rec.ends() == [("r2", END_REASON_REQUEST_END)]
+    assert len(server.sessions) == 6
+    assert server.utterances == ["The next request."]
+    assert bytes(rec.audio) == AUDIO
+
+
+def test_a_used_up_allowance_is_fatal_and_not_retried(server, config):
+    server.refuse_sessions = ("allowance_exhausted", 4402)
+
+    async def script(rec, ten_env):
+        await rec.wait_for(lambda rec: rec.errors())
+        await rec.send_text(ten_env, "r1", "Hello world.", end=True)
+        await rec.wait_for(lambda rec: len(rec.errors()) >= 2)
+
+    rec = run(config, script)
+
+    assert _error_codes(rec.errors()) == [
+        ("", FATAL_ERROR, "allowance_exhausted"),
+        ("r1", FATAL_ERROR, "allowance_exhausted"),
+    ]
+    assert len(server.sessions) == 1
+    assert "pcm_frame" not in rec.names()
+
+
+def test_an_unsupported_sample_rate_is_fatal_before_any_connection(server):
+    async def script(rec, ten_env):
+        await rec.wait_for(lambda rec: rec.errors())
+
+    rec = run(
+        {
+            "params": {
+                "api_key": API_KEY,
+                "base_url": server.url,
+                "sample_rate": 12345,
+            }
+        },
+        script,
+    )
+
+    (error,) = rec.errors()
+    assert error["code"] == FATAL_ERROR
+    assert "sample_rate" in error["message"]
+    assert server.sessions == []
+
+
+def test_frames_that_are_not_kalpa_messages_are_ignored(server, config):
+    # Text that is not JSON, JSON that is not an object, a binary frame,
+    # audio that is not base64 and a message type the client does not know.
+    server.noise = True
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", "Hello world.", end=True)
+
+    rec = run(config, script, done=lambda rec: rec.ended("r1"))
+
+    assert not rec.errors()
+    assert rec.ends() == [("r1", END_REASON_REQUEST_END)]
+    assert bytes(rec.audio) == AUDIO
+
+
+def test_a_response_cancelled_without_an_error_fails_its_request(
+    server, config
+):
+    server.cancel_responses = 1
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", "Cancelled by Kalpa.", end=True)
+        await rec.send_text(
+            ten_env, "r2", "The next request.", end=True, turn_id=2
+        )
+        await rec.wait_for(lambda rec: rec.ended("r2"))
+
+    rec = run(config, script)
+
+    assert _error_codes(rec.errors()) == [
+        ("r1", NON_FATAL_ERROR, "response_cancelled")
+    ]
+    assert rec.ends() == [("r2", END_REASON_REQUEST_END)]
+    assert bytes(rec.audio) == AUDIO

@@ -3,8 +3,10 @@
 # Licensed under the Apache License, Version 2.0.
 # See the LICENSE file for more information.
 #
+import importlib
 import json
 import threading
+from types import SimpleNamespace
 from typing_extensions import override
 import pytest
 from ten_runtime import (
@@ -107,6 +109,47 @@ def server():
     mock = MockKalpaServer().start()
     yield mock
     mock.stop()
+
+
+class FakeClock:
+    """Stands in for the `time` module. It moves only when a test moves it.
+
+    The steps used are multiples of 125 ms, which are exact in binary, so
+    the milliseconds computed from them are exact too.
+    """
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, ms: int) -> None:
+        self.now += ms / 1000
+
+
+@pytest.fixture
+def running():
+    """The extension's modules as the TEN runtime runs them.
+
+    The runtime imports the extension as the top-level package
+    `kalpa_tts_python`; the tests import it as
+    `ten_packages.extension.kalpa_tts_python`. Those are two copies, so a
+    test that replaces something in the running extension does it here.
+    """
+    return SimpleNamespace(
+        extension=importlib.import_module("kalpa_tts_python.extension"),
+        kalpa_tts=importlib.import_module("kalpa_tts_python.kalpa_tts"),
+    )
+
+
+@pytest.fixture
+def clock(monkeypatch, running):
+    """The clock the extension and its client read, under the test's hand."""
+    fake = FakeClock()
+    monkeypatch.setattr(running.extension, "time", fake)
+    monkeypatch.setattr(running.kalpa_tts, "time", fake)
+    return fake
 
 
 @pytest.fixture

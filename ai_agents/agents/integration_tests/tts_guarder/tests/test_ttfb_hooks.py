@@ -372,3 +372,55 @@ def test_speko_old_connection_audio_cannot_complete_new_request(monkeypatch):
     now[0] = 20_000_000
     connection.observe_receive(wire("speko", "new", audio=True))
     assert reference.elapsed_ms("new") == 20
+
+
+def test_kalpa_hook_ignores_control_frames_and_server_events(monkeypatch):
+    now = [0]
+    monkeypatch.setattr("tests.ttfb_hooks.base.time.monotonic_ns", lambda: now[0])
+    reference = TTFBReference()
+    observer = KalpaObserver(reference)
+    reference.begin_request("request")
+    for frame in (
+        {"type": "initializeConnection", "api_key": "key", "model": "kalpa-tts-1"},
+        {"type": "sendText", "text": ""},
+        {"type": "sendText", "text": " \n\t"},
+        {"type": "sendText", "text": "", "flush": True},
+    ):
+        observer.observe_send(json.dumps(frame))
+    now[0] = 10_000_000
+    observer.observe_send(wire("kalpa", "request"))
+    observer.observe_send(json.dumps({"type": "sendText", "text": "", "flush": True}))
+    for event in (
+        {"type": "sessionCreated", "session_id": "session"},
+        {"type": "responseCreated", "response_id": "request"},
+        {"type": "error", "fatal": False, "error": {"type": "inference_error"}},
+    ):
+        now[0] += 5_000_000
+        observer.observe_receive(json.dumps(event))
+    now[0] = 40_000_000
+    observer.observe_receive(wire("kalpa", "request", audio=True, empty=True))
+    assert reference.elapsed_ms("request") is None
+    now[0] = 45_000_000
+    observer.observe_receive(wire("kalpa", "request", audio=True))
+    observer.observe_receive(
+        json.dumps({"type": "responseDone", "response_id": "request"})
+    )
+    assert reference.elapsed_ms("request") == 35
+
+
+def test_kalpa_old_connection_audio_cannot_complete_new_request(monkeypatch):
+    now = [0]
+    monkeypatch.setattr("tests.ttfb_hooks.base.time.monotonic_ns", lambda: now[0])
+    reference = TTFBReference()
+    old_connection = KalpaObserver(reference)
+    reference.begin_request("old")
+    old_connection.observe_send(wire("kalpa", "old"))
+    reference.begin_request("new")
+    connection = KalpaObserver(reference)
+    connection.observe_send(wire("kalpa", "new"))
+    now[0] = 10_000_000
+    old_connection.observe_receive(wire("kalpa", "old", audio=True))
+    assert reference.elapsed_ms("new") is None
+    now[0] = 20_000_000
+    connection.observe_receive(wire("kalpa", "new", audio=True))
+    assert reference.elapsed_ms("new") == 20
