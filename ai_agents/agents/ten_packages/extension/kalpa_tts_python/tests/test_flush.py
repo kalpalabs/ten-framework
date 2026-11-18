@@ -207,6 +207,95 @@ def test_a_flush_while_a_send_is_blocked_ends_the_request(
     assert not rec.errors()
 
 
+def test_late_events_of_a_replaced_connection_do_not_reach_the_next_request(
+    server, config, monkeypatch, running
+):
+    # Every client the extension starts, with the loop it runs on.
+    clients = []
+    kalpa_tts = running.kalpa_tts
+    start = kalpa_tts.KalpaTTSClient.start
+
+    def recorded_start(self):
+        clients.append((self, asyncio.get_running_loop()))
+        start(self)
+
+    monkeypatch.setattr(kalpa_tts.KalpaTTSClient, "start", recorded_start)
+    server.holds = [1]
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", "Interrupted.", end=True)
+        await rec.wait_for(lambda rec: "pcm_frame" in rec.names())
+        await rec.send_flush(ten_env)
+        await rec.wait_for(lambda rec: "tts_flush_end" in rec.names())
+        server.holds = [1]
+        await rec.send_text(
+            ten_env, "r2", "This one completes.", end=True, turn_id=2
+        )
+        await rec.wait_for(lambda rec: len(rec.of("pcm_frame")) == 2)
+        # What r1's connection could still have delivered while r2 is
+        # speaking: more audio, the end of its response, an error and the
+        # loss of the connection.
+        old, loop = clients[0]
+        late = kalpa_tts.KalpaTTSError("inference_error", "Too late.")
+        for name, args in (
+            ("on_audio", (b"\x7f\x00" * 480, 0.0)),
+            ("on_response_done", ("completed",)),
+            ("on_response_error", (late,)),
+            ("on_connection_failed", (late, False)),
+        ):
+            deliver = getattr(old, "_emit")(name, *args)
+            asyncio.run_coroutine_threadsafe(deliver, loop).result(5)
+        await asyncio.sleep(0.2)
+        server.release()
+        await rec.wait_for(lambda rec: rec.ended("r2"))
+
+    rec = run(config, script)
+
+    # None of it touched r2: no extra audio, no early end, no error.
+    assert len(clients) == 2
+    assert rec.ends() == [
+        ("r1", END_REASON_INTERRUPTED),
+        ("r2", END_REASON_REQUEST_END),
+    ]
+    assert bytes(rec.audio) == CHUNKS[0][:-1] + AUDIO
+    assert not rec.errors()
+
+
+@pytest.mark.parametrize("waiting_for", ["session", "send"])
+def test_stopping_while_a_request_is_blocked_stops_the_extension(
+    server, config, monkeypatch, running, waiting_for
+):
+    blocked = threading.Event()
+    if waiting_for == "session":
+        server.hold_session = True
+    else:
+
+        async def blocked_send(self, text, flush=False):
+            blocked.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(
+            running.kalpa_tts.KalpaTTSClient, "send_text", blocked_send
+        )
+
+    async def script(rec, ten_env):
+        await rec.send_text(ten_env, "r1", "Never spoken.", end=True)
+        if waiting_for == "send":
+            await rec.wait_for(lambda rec: blocked.is_set())
+        else:
+            await rec.wait_for(
+                lambda rec: server.sessions and server.sessions[0]["init"]
+            )
+            await asyncio.sleep(0.2)
+
+    # The extension is stopped here. `run` returns once it has stopped.
+    rec = run(config, script, timeout_s=10.0)
+
+    assert "pcm_frame" not in rec.names()
+    assert server.utterances == []
+    assert not rec.errors()
+
+
 def test_a_second_flush_leaves_the_new_session_alone(server, config):
     server.holds = [1]
 
