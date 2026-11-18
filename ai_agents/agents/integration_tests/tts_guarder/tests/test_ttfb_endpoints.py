@@ -54,7 +54,7 @@ CASES = [
     (
         "kalpa_tts_python",
         {"url": "wss://top.test/ws", "params": {"url": "wss://nested.test/ws"}},
-        "wss://top.test/ws",
+        "wss://nested.test/ws",
     ),
     (
         "kalpa_tts_python",
